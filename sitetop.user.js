@@ -98,7 +98,6 @@
     function runWorkerTab(job) {
         var apiAjaxUrl = (job.apiOrigin || "https://sitetop.net") + "/wp-admin/admin-ajax.php";
 
-        // Chặn widget top.js gốc tự bắn verify_access (referrer rỗng) làm ghi đè phiên
         try {
             var origXhrOpen = pageWin.XMLHttpRequest && pageWin.XMLHttpRequest.prototype.open;
             var origXhrSend = pageWin.XMLHttpRequest && pageWin.XMLHttpRequest.prototype.send;
@@ -202,30 +201,46 @@
             var verifyRes = await callVerifyAccess(currentVerifyUrl);
             var vdata = verifyRes && verifyRes.data ? verifyRes.data : {};
 
-            // Nếu vừa mở shortlink đã bắn verify quá nhanh (< ~5s) hoặc chưa qua Google check -> đợi nhịp rồi gọi lại
-            if (vdata && (vdata.qua_nhanh || vdata.google_verified === false)) {
-                publishStatus({
-                    status: "progress",
-                    main: "Đang đợi nhịp xác thực tự nhiên...",
-                    sub: "Tránh cờ vào trang quá nhanh (5s)",
-                    pct: 14,
-                    waitSec: 5
-                });
-                await sleep(5000);
-                verifyRes = await callVerifyAccess(currentVerifyUrl);
-                vdata = verifyRes && verifyRes.data ? verifyRes.data : {};
+            async function matchTargetUrlIfNeeded() {
+                if (vdata && (!vdata.url_path_matched || !vdata.url_valid) && vdata.target_url) {
+                    try {
+                        var targetParsed = new URL(vdata.target_url);
+                        if (bareHost(targetParsed.hostname) === bareHost(window.location.hostname)) {
+                            currentVerifyUrl = vdata.target_url;
+                            verifyRes = await callVerifyAccess(currentVerifyUrl);
+                            vdata = verifyRes && verifyRes.data ? verifyRes.data : {};
+                        }
+                    } catch (e) {}
+                }
             }
 
-            // Nếu server chỉ định bài viết cụ thể cùng domain
-            if (vdata && (!vdata.url_path_matched || !vdata.url_valid) && vdata.target_url) {
-                try {
-                    var targetParsed = new URL(vdata.target_url);
-                    if (bareHost(targetParsed.hostname) === bareHost(window.location.hostname)) {
-                        currentVerifyUrl = vdata.target_url;
-                        verifyRes = await callVerifyAccess(currentVerifyUrl);
-                        vdata = verifyRes && verifyRes.data ? verifyRes.data : {};
-                    }
-                } catch (e) {}
+            await matchTargetUrlIfNeeded();
+
+            var googleWaitAttempt = 0;
+            while (
+                googleWaitAttempt < 6 &&
+                verifyRes &&
+                verifyRes.success &&
+                vdata.session_valid &&
+                vdata.url_valid &&
+                (vdata.qua_nhanh || vdata.google_verified === false)
+            ) {
+                googleWaitAttempt++;
+                var gvStepEnd = Date.now() + 3500;
+                while (Date.now() < gvStepEnd) {
+                    var gvLeft = Math.max(1, Math.ceil((gvStepEnd - Date.now()) / 1000));
+                    publishStatus({
+                        status: "progress",
+                        main: "Đang xác thực nhịp Google (" + googleWaitAttempt + "/6)...",
+                        sub: "Chờ server mở khoá phiên tự nhiên (" + gvLeft + "s)",
+                        pct: Math.min(18, 11 + googleWaitAttempt),
+                        waitSec: gvLeft
+                    });
+                    await sleep(Math.min(1000, Math.max(200, gvStepEnd - Date.now())));
+                }
+                verifyRes = await callVerifyAccess(currentVerifyUrl);
+                vdata = verifyRes && verifyRes.data ? verifyRes.data : {};
+                await matchTargetUrlIfNeeded();
             }
 
             if (!verifyRes || !verifyRes.success || !vdata.session_valid || !vdata.url_valid) {
@@ -247,12 +262,18 @@
             var remainingSec = parseInt(vdata.remaining, 10);
             var hasServerRemaining = !isNaN(remainingSec) && remainingSec >= 0;
             var waitSec = hasServerRemaining ? remainingSec : (parseInt(vdata.onsite_time, 10) || 70);
+            var lastPingAt = Date.now();
 
-            var pingTimer = setInterval(function () {
-                siteFetchAjax("sitetop_widget_ping", {
+            function sendPing() {
+                lastPingAt = Date.now();
+                return siteFetchAjax("sitetop_widget_ping", {
                     session_id: wSid,
                     nonce: job.nonce || ""
                 }).catch(function () {});
+            }
+
+            var pingTimer = setInterval(function () {
+                sendPing();
             }, 9000);
 
             try {
@@ -262,7 +283,6 @@
                     nonce: job.nonce || ""
                 }).catch(function () {});
 
-                // Đánh dấu đã bấm nút; chỉ reset timer server nếu chưa có remaining đang chạy sẵn
                 await siteFetchAjax("sitetop_widget_start_timer", {
                     session_id: wSid,
                     mark: "1",
@@ -280,6 +300,7 @@
                     var step1EndPct = trafficType === "2step" ? 75 : 94;
                     var endAt = Date.now() + (waitSec + 1) * 1000;
                     while (Date.now() < endAt) {
+                        if ((Date.now() - lastPingAt) >= 9000) sendPing();
                         var left = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
                         var ratio = (waitSec + 1 - left) / Math.max(1, waitSec + 1);
                         var pct = 18 + Math.round(ratio * (step1EndPct - 18));
@@ -339,6 +360,7 @@
 
                     var endAt2 = Date.now() + 16000;
                     while (Date.now() < endAt2) {
+                        if ((Date.now() - lastPingAt) >= 9000) sendPing();
                         var left2 = Math.max(0, Math.ceil((endAt2 - Date.now()) / 1000));
                         var pct2 = 78 + Math.round(((16 - left2) / 16) * 17);
                         publishStatus({
@@ -376,19 +398,37 @@
                         }
                     }
 
-                    if (codeRes && codeRes.data && codeRes.data.data && codeRes.data.data.chan_tuagio) {
-                        throw new Error((codeRes.data && codeRes.data.message) || "Server từ chối cấp mã");
+                    var errObj = codeRes && codeRes.data && typeof codeRes.data === "object" ? codeRes.data : null;
+                    var errInner = errObj && errObj.data && typeof errObj.data === "object" ? errObj.data : errObj;
+                    var serverMsg = (errObj && errObj.message) || (typeof (codeRes && codeRes.data) === "string" ? codeRes.data : "");
+                    var serverRemRaw = errInner && errInner.remaining !== undefined ? parseInt(errInner.remaining, 10) : NaN;
+                    var hasPositiveRem = !isNaN(serverRemRaw) && serverRemRaw > 0;
+
+                    if (errInner && errInner.chan_tuagio) {
+                        throw new Error(serverMsg || "Server từ chối cấp mã");
                     }
 
-                    var extraWait = (codeRes && codeRes.data && codeRes.data.data && parseInt(codeRes.data.data.remaining, 10)) || 3;
-                    extraWait = Math.max(2, Math.min(20, extraWait));
+                    if (!hasPositiveRem) {
+                        if (attempt === 0) {
+                            await callVerifyAccess(currentVerifyUrl).catch(function () {});
+                            await sendPing();
+                            await sleep(2000);
+                            continue;
+                        }
+                        if (serverMsg) {
+                            throw new Error(serverMsg);
+                        }
+                    }
+
+                    var extraWait = hasPositiveRem ? Math.max(2, Math.min(20, serverRemRaw)) : 3;
                     var extraEnd = Date.now() + extraWait * 1000;
                     while (Date.now() < extraEnd) {
+                        if ((Date.now() - lastPingAt) >= 9000) sendPing();
                         var eLeft = Math.max(0, Math.ceil((extraEnd - Date.now()) / 1000));
                         publishStatus({
                             status: "progress",
                             main: "Chờ đồng bộ server (" + eLeft + "s)...",
-                            sub: "Lần thử " + (attempt + 1) + "/6",
+                            sub: serverMsg || ("Lần thử " + (attempt + 1) + "/6"),
                             pct: 96,
                             waitSec: eLeft
                         });
@@ -1001,7 +1041,6 @@
         var statusPollTimer = null;
         var wrongUrlRetries = 0;
 
-        // Hook fetch trên trang để bắt ngay link đích khi submit mã thành công
         var origFetch = pageWin.fetch;
         if (typeof origFetch === "function" && !origFetch.__stHooked) {
             var wrappedFetch = function () {
@@ -1110,7 +1149,6 @@
                 var topCfg = await fetchTopJsNonce();
                 var parsedTarget = new URL(cleanUrl);
 
-                // Reset status trước khi mở tab nền
                 saveJsonStorage(STORAGE_STATUS_KEY, {
                     sessionId: taskInfo.sessionId,
                     status: "init",
@@ -1170,7 +1208,6 @@
                     });
                 }
 
-                // Fallback poll phòng trường hợp GM_addValueChangeListener trễ
                 statusPollTimer = setInterval(function () {
                     var st = loadJsonStorage(STORAGE_STATUS_KEY, null);
                     handleWorkerStatus(st);
@@ -1196,7 +1233,6 @@
             runBypass(val);
         });
 
-        // Tự dò URL theo thứ tự: Từ khoá -> Cache campaign -> OCR ảnh SERP
         (async function autoDetectAndStart() {
             var fromKeyword = extractDomainFromText(taskInfo.keyword);
             if (fromKeyword) {
