@@ -80,10 +80,6 @@
         return new Promise(function (resolve) { setTimeout(resolve, ms); });
     }
 
-    /* =========================================================================
-     * 1. WORKER TAB MODE (chạy trên trang đích để gửi request cross-site thật)
-     * ========================================================================= */
-
     function getMatchedWorkerJob() {
         var job = loadJsonStorage(STORAGE_JOB_KEY, null);
         if (!job || !job.sessionId || !job.createdAt) return null;
@@ -430,10 +426,6 @@
         }
         return;
     }
-
-    /* =========================================================================
-     * 2. SITETOP MAIN PAGE MODE (chạy trên sitetop.net)
-     * ========================================================================= */
 
     function loadUiPrefs() {
         var parsed = loadJsonStorage(STORAGE_UI_KEY, {});
