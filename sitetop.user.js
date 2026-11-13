@@ -120,6 +120,20 @@
             }
         } catch (e) {}
 
+        try {
+            if (pageWin.navigator && typeof pageWin.navigator.sendBeacon === "function" && !pageWin.navigator.sendBeacon.__stWorkerBlocked) {
+                var origBeacon = pageWin.navigator.sendBeacon.bind(pageWin.navigator);
+                var wrappedBeacon = function (url, data) {
+                    if (String(url || "").indexOf("sitetop.net") !== -1) {
+                        return true;
+                    }
+                    return origBeacon(url, data);
+                };
+                wrappedBeacon.__stWorkerBlocked = true;
+                pageWin.navigator.sendBeacon = wrappedBeacon;
+            }
+        } catch (e) {}
+
         function publishStatus(patch) {
             saveJsonStorage(STORAGE_STATUS_KEY, Object.assign({
                 sessionId: job.sessionId,
@@ -277,54 +291,56 @@
             }, 9000);
 
             try {
-                await siteFetchAjax("sitetop_track_direct_click", {
-                    session_id: wSid,
-                    url_matched: "1",
-                    nonce: job.nonce || ""
-                }).catch(function () {});
+                if (!vdata.code_ready) {
+                    await siteFetchAjax("sitetop_track_direct_click", {
+                        session_id: wSid,
+                        url_matched: "1",
+                        nonce: job.nonce || ""
+                    }).catch(function () {});
 
-                await siteFetchAjax("sitetop_widget_start_timer", {
-                    session_id: wSid,
-                    mark: "1",
-                    nonce: job.nonce || ""
-                }).catch(function () {});
-
-                if (!hasServerRemaining) {
                     await siteFetchAjax("sitetop_widget_start_timer", {
                         session_id: wSid,
+                        mark: "1",
+                        nonce: job.nonce || ""
+                    }).catch(function () {});
+
+                    if (!hasServerRemaining) {
+                        await siteFetchAjax("sitetop_widget_start_timer", {
+                            session_id: wSid,
+                            nonce: job.nonce || ""
+                        }).catch(function () {});
+                    }
+
+                    if (waitSec > 0) {
+                        var step1EndPct = trafficType === "2step" ? 75 : 94;
+                        var endAt = Date.now() + (waitSec + 1) * 1000;
+                        while (Date.now() < endAt) {
+                            if ((Date.now() - lastPingAt) >= 9000) sendPing();
+                            var left = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
+                            var ratio = (waitSec + 1 - left) / Math.max(1, waitSec + 1);
+                            var pct = 18 + Math.round(ratio * (step1EndPct - 18));
+                            publishStatus({
+                                status: "progress",
+                                main: "Bước 1" + (trafficType === "2step" ? "/2" : "") + ": Đang đợi đếm giờ (" + left + "s)",
+                                sub: "Đang giữ nhịp ping từ " + window.location.hostname,
+                                pct: pct,
+                                waitSec: left
+                            });
+                            await sleep(Math.min(1000, Math.max(200, endAt - Date.now())));
+                        }
+                    }
+
+                    await siteFetchAjax("sitetop_report_behavior", {
+                        session_id: wSid,
+                        mouse_movements: String(16 + Math.floor(Math.random() * 20)),
+                        scroll_depth: "95",
+                        time_on_page: String(Math.max(10, waitSec)),
+                        tab_switches: "0",
+                        clicks: "3",
+                        tua_gio: "0",
                         nonce: job.nonce || ""
                     }).catch(function () {});
                 }
-
-                if (!vdata.code_ready && waitSec > 0) {
-                    var step1EndPct = trafficType === "2step" ? 75 : 94;
-                    var endAt = Date.now() + (waitSec + 1) * 1000;
-                    while (Date.now() < endAt) {
-                        if ((Date.now() - lastPingAt) >= 9000) sendPing();
-                        var left = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
-                        var ratio = (waitSec + 1 - left) / Math.max(1, waitSec + 1);
-                        var pct = 18 + Math.round(ratio * (step1EndPct - 18));
-                        publishStatus({
-                            status: "progress",
-                            main: "Bước 1" + (trafficType === "2step" ? "/2" : "") + ": Đang đợi đếm giờ (" + left + "s)",
-                            sub: "Đang giữ nhịp ping từ " + window.location.hostname,
-                            pct: pct,
-                            waitSec: left
-                        });
-                        await sleep(Math.min(1000, Math.max(200, endAt - Date.now())));
-                    }
-                }
-
-                await siteFetchAjax("sitetop_report_behavior", {
-                    session_id: wSid,
-                    mouse_movements: String(16 + Math.floor(Math.random() * 20)),
-                    scroll_depth: "95",
-                    time_on_page: String(Math.max(10, waitSec)),
-                    tab_switches: "0",
-                    clicks: "3",
-                    tua_gio: "0",
-                    nonce: job.nonce || ""
-                }).catch(function () {});
 
                 if (trafficType === "2step") {
                     var links = findInternalLinksInDom();
@@ -374,6 +390,11 @@
                     }
                 }
 
+                await siteFetchAjax("sitetop_unlock_heartbeat", {
+                    session_id: wSid,
+                    nonce: job.nonce || ""
+                }).catch(function () {});
+
                 for (var attempt = 0; attempt < 6; attempt++) {
                     var codeRes = await siteFetchAjax("sitetop_get_code", {
                         session_id: wSid,
@@ -391,7 +412,8 @@
                             publishStatus({
                                 status: "code",
                                 code: String(extractedCode).trim(),
-                                targetUrl: currentVerifyUrl
+                                targetUrl: currentVerifyUrl,
+                                verifiedSessionId: wSid
                             });
                             try { window.close(); } catch (e) {}
                             return;
@@ -1035,6 +1057,7 @@
         }
 
         var isRunning = false;
+        var verifiedSid = taskInfo.sessionId;
         var finalUrlResolved = false;
         var activeWorkerTab = null;
         var statusListenerId = null;
@@ -1044,6 +1067,15 @@
         var origFetch = pageWin.fetch;
         if (typeof origFetch === "function" && !origFetch.__stHooked) {
             var wrappedFetch = function () {
+                try {
+                    var reqInit = arguments[1];
+                    if (reqInit && reqInit.body && typeof reqInit.body.get === "function" && typeof reqInit.body.set === "function") {
+                        var act = reqInit.body.get("action");
+                        if (verifiedSid && (act === "sitetop_verify_shortlink_code" || act === "sitetop_check_code_ready" || act === "sitetop_unlock_heartbeat")) {
+                            reqInit.body.set("session_id", verifiedSid);
+                        }
+                    }
+                } catch (e) {}
                 return origFetch.apply(this, arguments).then(function (response) {
                     try {
                         var clone = response.clone();
@@ -1088,15 +1120,22 @@
             closeWorkerTab();
         });
 
-        function applyCodeAndSubmit(codeStr) {
+        function applyCodeAndSubmit(codeStr, codeSessionId) {
+            if (codeSessionId) {
+                verifiedSid = codeSessionId;
+                try { pageWin.sessionId = codeSessionId; } catch (e) {}
+            }
             ui.showCode(codeStr);
             ui.setTimer(0);
             codeInputEl.disabled = false;
             btnUnlockEl.disabled = false;
             setNativeInputValue(codeInputEl, codeStr);
+            sendSameOriginAjax(taskInfo.ajaxUrl, "sitetop_check_code_ready", {
+                session_id: verifiedSid
+            });
 
             try {
-                localStorage.setItem("code_input_" + taskInfo.sessionId, JSON.stringify({
+                localStorage.setItem("code_input_" + (verifiedSid || taskInfo.sessionId), JSON.stringify({
                     code: codeStr,
                     ts: Date.now()
                 }));
@@ -1181,7 +1220,7 @@
                         if (taskInfo.campaignId) {
                             saveDomainCache(taskInfo.campaignId, st.targetUrl || cleanUrl);
                         }
-                        applyCodeAndSubmit(st.code);
+                        applyCodeAndSubmit(st.code, st.verifiedSessionId || taskInfo.sessionId);
                     } else if (st.status === "wrong_url" && st.wantUrl && wrongUrlRetries < 1) {
                         wrongUrlRetries++;
                         closeWorkerTab();
@@ -1254,6 +1293,7 @@
             if (taskInfo.screenshotUrl) {
                 ui.setStatus("Đang quét tên miền từ ảnh...", "Phân tích ảnh kết quả Google qua OCR...", 3);
                 var ocrUrl = await extractDomainViaOCR(taskInfo.screenshotUrl);
+                if (isRunning) return;
                 if (ocrUrl) {
                     ui.setUrlInput(ocrUrl);
                     ui.setStatus("OCR thành công: " + ocrUrl, "Đang khởi chạy tab nền vượt link...", 5);
